@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ACL Configuration for MCP Tools
+#
+# Each tool maps to a list of ACL strings from staffs.acl_array.
+# Access is granted if the user has ANY of the listed ACLs (OR logic).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Policy when a tool is NOT listed in tool_acls:
+#   "open"  → allow any authenticated user (must exist in staffs + active)
+#   "deny"  → block unless explicitly listed
+default_policy: "deny"
+
+# ACL values that grant access to ALL tools (bypass per-tool checks)
+superuser_acls:
+  - STAFF_EDIT
+
+# Tools that require NO authentication at all (completely open)
+public_tools: []
+
+# ── Per-tool ACL mappings ───────────────────────────────────────────────────
+# Format: tool_name → list of ACL strings (user needs at least one)
+tool_acls:
+
+  # ── Database tools (powerful — restricted to dashboard/report users) ──
+  query:
+    - DASHBOARD_TASK_VIEW
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+    - DASHBOARD_ENQUIRIES_VIEW
+
+  list_tables:
+    - DASHBOARD_TASK_VIEW
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+
+  describe_table:
+    - DASHBOARD_TASK_VIEW
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+
+  list_schemas:
+    - DASHBOARD_TASK_VIEW
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+
+  # ── Sales funnel intelligence (read-oriented — broader access) ──
+  get_sales_funnel_context:
+    - DEVELOPMENT_OPP_LIST_VIEW
+    - DEVELOPMENT_OPP_VIEW
+    - DASHBOARD_ENQUIRIES_VIEW
+    - DASHBOARD_TASK_VIEW
+
+  classify_sales_intent:
+    - DEVELOPMENT_OPP_LIST_VIEW
+    - DEVELOPMENT_OPP_VIEW
+    - DASHBOARD_ENQUIRIES_VIEW
+    - ENQUIRY_LIST_VIEW
+
+  get_query_template:
+    - DEVELOPMENT_OPP_LIST_VIEW
+    - DASHBOARD_ENQUIRIES_VIEW
+    - DASHBOARD_TASK_VIEW
+
+  list_query_patterns:
+    - DEVELOPMENT_OPP_LIST_VIEW
+    - DASHBOARD_ENQUIRIES_VIEW
+    - DASHBOARD_TASK_VIEW
+
+  # ── Query analysis & rule generation (admin/engineering tools) ──
+  analyze_query:
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+    - STAFF_EDIT
+
+  generate_rules:
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+    - STAFF_EDIT
+
+  # ── Redash integration (report-level access) ──
+  fetch_redash_query:
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+    - STAFF_EDIT
+
+  generate_rules_from_redash:
+    - DASHBOARD_TASK_REPORT_DOWNLOAD
+    - STAFF_EDIT

@@ -7,11 +7,18 @@ import {
 import express from "express";
 import cors from "cors";
 import { toolDefinitions, handleToolCall, pool } from "./tools.js";
+import { resolveUserEmail, filterToolsByAccess, loadAclConfig } from "./acl.js";
+
+// Load ACL config at startup
+loadAclConfig();
 
 // Create Express app
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ── Session email storage (SSE transport → user email from headers) ──
+const sessionEmails = new Map<SSEServerTransport, string>();
 
 // Create MCP server
 const server = new Server(
@@ -26,24 +33,49 @@ const server = new Server(
   }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: toolDefinitions,
-}));
+server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+  const meta = request.params?._meta as Record<string, unknown> | undefined;
+  // Try to find session email from any active session
+  let sessionEmail: string | undefined;
+  for (const [, email] of sessionEmails) {
+    sessionEmail = email;
+    break;
+  }
+  const userEmail = resolveUserEmail(meta, sessionEmail);
+  const tools = await filterToolsByAccess(toolDefinitions, userEmail, pool);
+  return { tools };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  return handleToolCall(name, args);
+  const { name, arguments: args, _meta } = request.params;
+  const meta = _meta as Record<string, unknown> | undefined;
+  // Try to find session email from any active session
+  let sessionEmail: string | undefined;
+  for (const [, email] of sessionEmails) {
+    sessionEmail = email;
+    break;
+  }
+  const userEmail = resolveUserEmail(meta, sessionEmail);
+  return handleToolCall(name, args, userEmail);
 });
 
 // SSE endpoint
 app.get("/sse", async (req, res) => {
-  console.log("New SSE connection established");
+  const headerEmail = req.headers["x-user-email"] as string | undefined;
+  console.log(`New SSE connection established${headerEmail ? ` (user: ${headerEmail})` : ""}`);
 
   const transport = new SSEServerTransport("/messages", res);
+
+  // Store header email for this session
+  if (headerEmail) {
+    sessionEmails.set(transport, headerEmail);
+  }
+
   await server.connect(transport);
 
   req.on("close", () => {
     console.log("SSE connection closed");
+    sessionEmails.delete(transport);
   });
 });
 

@@ -6,6 +6,10 @@ import {
   getQueryTemplate,
   listQueryPatterns,
 } from "./schema-rules.js";
+import { analyzeQuery } from "./query-analyzer.js";
+import { generateRules } from "./rule-generator.js";
+import { RedashClient, parseQueryIds } from "./redash-client.js";
+import { checkToolAccess } from "./acl.js";
 
 const { Pool } = pg;
 
@@ -41,6 +45,28 @@ const ClassifyIntentInputSchema = z.object({
 
 const GetQueryTemplateInputSchema = z.object({
   pattern_name: z.string().min(1, "Pattern name cannot be empty"),
+});
+
+const AnalyzeQueryInputSchema = z.object({
+  sql: z.string().min(1, "SQL query cannot be empty"),
+});
+
+const GenerateRulesInputSchema = z.object({
+  sql: z.string().min(1, "SQL query cannot be empty"),
+  pattern_name: z.string().min(1, "Pattern name cannot be empty"),
+  description: z.string().min(1, "Description cannot be empty"),
+  category: z.string().min(1, "Category cannot be empty"),
+  intent_keywords: z.array(z.string()).optional(),
+});
+
+const FetchRedashQueryInputSchema = z.object({
+  query_ids: z.string().min(1, "Query IDs cannot be empty"),
+});
+
+const GenerateRulesFromRedashInputSchema = z.object({
+  query_ids: z.string().min(1, "Query IDs cannot be empty"),
+  category: z.string().optional().default("custom"),
+  intent_keywords: z.array(z.string()).optional(),
 });
 
 // ── Read-only query helper ─────────────────────────────────────────────────
@@ -178,15 +204,127 @@ export const toolDefinitions = [
       properties: {},
     },
   },
+
+  // ── Query analysis & rule generation tools ──
+  {
+    name: "analyze_query",
+    description:
+      "Analyze a SQL query to extract its structural patterns — tables, joins, CTEs, aggregations, date filters, timezone conversions, exclusions, CASE statements, window functions, and more. Returns a detailed breakdown useful for understanding or generating rules.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        sql: {
+          type: "string",
+          description: "The SQL query to analyze",
+        },
+      },
+      required: ["sql"],
+    },
+  },
+  {
+    name: "generate_rules",
+    description:
+      "Generate YAML business rules, an MCP tool definition, and a handler code snippet from a SQL query. Internally runs analyze_query first, then produces artifacts ready to add to the config and codebase.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        sql: {
+          type: "string",
+          description: "The SQL query to generate rules from",
+        },
+        pattern_name: {
+          type: "string",
+          description:
+            "Machine-readable name in snake_case (e.g. prospect_aging)",
+        },
+        description: {
+          type: "string",
+          description: "Human-readable description of the query",
+        },
+        category: {
+          type: "string",
+          description:
+            "Category for the rule (e.g. mtd_aggregate, aging_reports)",
+        },
+        intent_keywords: {
+          type: "array",
+          description:
+            "Optional list of natural-language keywords that should trigger this pattern",
+          items: { type: "string" },
+        },
+      },
+      required: ["sql", "pattern_name", "description", "category"],
+    },
+  },
+
+  // ── Redash integration tools ──
+  {
+    name: "fetch_redash_query",
+    description:
+      "Fetch one or more SQL query definitions from Redash by query ID. Returns the SQL text, name, description, tags, and metadata for each query. Accepts a single ID or comma-separated IDs (e.g. '42' or '42,99,103').",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query_ids: {
+          type: "string",
+          description:
+            "Redash query ID(s) — a single number or comma-separated list (e.g. '42' or '42,99,103')",
+        },
+      },
+      required: ["query_ids"],
+    },
+  },
+  {
+    name: "generate_rules_from_redash",
+    description:
+      "Fetch SQL queries from Redash by ID, then analyze each and generate YAML rules, MCP tool definitions, and handler code. Combines fetch_redash_query + analyze_query + generate_rules in one step. Uses the Redash query name as pattern_name and description.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query_ids: {
+          type: "string",
+          description:
+            "Redash query ID(s) — a single number or comma-separated list",
+        },
+        category: {
+          type: "string",
+          description:
+            "Category for all generated rules (default: 'custom')",
+        },
+        intent_keywords: {
+          type: "array",
+          description:
+            "Optional intent keywords to attach to all generated patterns",
+          items: { type: "string" },
+        },
+      },
+      required: ["query_ids"],
+    },
+  },
 ];
 
 // ── Tool handler ───────────────────────────────────────────────────────────
 
 export async function handleToolCall(
   name: string,
-  args: Record<string, unknown> | undefined
+  args: Record<string, unknown> | undefined,
+  userEmail?: string
 ): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
   try {
+    // ── ACL enforcement ──
+    const aclResult = await checkToolAccess(name, userEmail, pool);
+    if (!aclResult.allowed) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Access denied: ${aclResult.reason}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
     // ── Database tools ──
 
     if (name === "query") {
@@ -299,6 +437,104 @@ export async function handleToolCall(
       const patterns = listQueryPatterns();
       return {
         content: [{ type: "text", text: JSON.stringify(patterns, null, 2) }],
+      };
+    }
+
+    // ── Query analysis & rule generation tools ──
+
+    if (name === "analyze_query") {
+      const { sql } = AnalyzeQueryInputSchema.parse(args);
+      const analysis = analyzeQuery(sql);
+      return {
+        content: [{ type: "text", text: JSON.stringify(analysis, null, 2) }],
+      };
+    }
+
+    if (name === "generate_rules") {
+      const input = GenerateRulesInputSchema.parse(args);
+      const analysis = analyzeQuery(input.sql);
+      const output = generateRules({
+        sql: input.sql,
+        analysis,
+        pattern_name: input.pattern_name,
+        description: input.description,
+        category: input.category,
+        intent_keywords: input.intent_keywords,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+      };
+    }
+
+    // ── Redash integration tools ──
+
+    if (name === "fetch_redash_query") {
+      const { query_ids } = FetchRedashQueryInputSchema.parse(args);
+      const ids = parseQueryIds(query_ids);
+      const client = new RedashClient();
+      const results = await client.fetchQueries(ids);
+
+      const output = results.map((r) => {
+        if (!r.success || !r.query) {
+          return { id: r.id, success: false, error: r.error };
+        }
+        const q = r.query;
+        return {
+          id: q.id,
+          success: true,
+          name: q.name,
+          description: q.description,
+          sql: q.query,
+          tags: q.tags,
+          data_source_id: q.data_source_id,
+          created_at: q.created_at,
+          updated_at: q.updated_at,
+          user: q.user,
+        };
+      });
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+      };
+    }
+
+    if (name === "generate_rules_from_redash") {
+      const input = GenerateRulesFromRedashInputSchema.parse(args);
+      const ids = parseQueryIds(input.query_ids);
+      const client = new RedashClient();
+      const fetched = await client.fetchQueries(ids);
+
+      const outputs = [];
+      for (const r of fetched) {
+        if (!r.success || !r.query) {
+          outputs.push({ id: r.id, success: false, error: r.error });
+          continue;
+        }
+        const q = r.query;
+        const patternName = q.name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_|_$/g, "");
+        const analysis = analyzeQuery(q.query);
+        const generated = generateRules({
+          sql: q.query,
+          analysis,
+          pattern_name: patternName,
+          description: q.description || q.name,
+          category: input.category,
+          intent_keywords: input.intent_keywords,
+        });
+        outputs.push({
+          id: q.id,
+          success: true,
+          redash_name: q.name,
+          pattern_name: patternName,
+          ...generated,
+        });
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(outputs, null, 2) }],
       };
     }
 
