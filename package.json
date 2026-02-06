@@ -1,0 +1,39 @@
+{
+  "name": "lohono-db-context",
+  "version": "1.0.0",
+  "description": "MCP server with Zod validation",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "dev:sse": "tsx src/index-sse.ts",
+    "start": "node dist/index.js",
+    "start:sse": "node dist/index-sse.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "mcp",
+    "zod",
+    "typescript"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^25.2.0",
+    "@types/pg": "^8.16.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "js-yaml": "^4.1.1",
+    "pg": "^8.18.0",
+    "zod": "^4.3.6"
+  }
+}
