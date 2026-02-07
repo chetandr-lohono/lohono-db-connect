@@ -1,6 +1,13 @@
 node_modules/
 dist/
+web/node_modules/
+web/dist/
 *.log
 .env
 .DS_Store
 *.tsbuildinfo
+
+# DB backups (keep directory, ignore dumps)
+db/*.sql
+db/*.sql.gz
+db/*.dump

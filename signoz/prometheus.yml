@@ -1,0 +1,6 @@
+# Minimal Prometheus config for SigNoz query-service
+# SigNoz uses this for span metrics aggregation
+
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s

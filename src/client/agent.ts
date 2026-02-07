@@ -1,0 +1,226 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { getToolsForClaude, callTool } from "./mcp-bridge.js";
+import {
+  appendMessage,
+  getMessages,
+  updateSessionTitle,
+  type Message as DbMessage,
+} from "./db.js";
+import { withClaudeSpan, withSpan, logInfo, logError } from "../observability/index.js";
+
+// ── Constants ──────────────────────────────────────────────────────────────
+
+const MAX_TOOL_ROUNDS = 20; // safety limit to avoid infinite loops
+
+const SYSTEM_PROMPT = `You are an expert data analyst assistant for Lohono Stays.
+You have access to the Lohono production database through MCP tools.
+Always use the available tools to answer questions about data, sales funnel, bookings, etc.
+Before writing SQL, call get_sales_funnel_context or classify_sales_intent to understand business rules.
+Format results clearly with tables or summaries as appropriate.`;
+
+// ── Claude client (singleton) ──────────────────────────────────────────────
+
+let anthropic: Anthropic;
+
+function getClient(): Anthropic {
+  if (!anthropic) {
+    anthropic = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+    });
+  }
+  return anthropic;
+}
+
+function getModel(): string {
+  return process.env.CLAUDE_MODEL || "claude-sonnet-4-5-20250929";
+}
+
+// ── Helpers: convert DB messages → Claude API format ───────────────────────
+
+type ClaudeMessage = Anthropic.Messages.MessageParam;
+type ContentBlock =
+  | Anthropic.Messages.TextBlockParam
+  | Anthropic.Messages.ToolUseBlockParam
+  | Anthropic.Messages.ToolResultBlockParam;
+
+function dbMessagesToClaudeMessages(dbMsgs: DbMessage[]): ClaudeMessage[] {
+  const claude: ClaudeMessage[] = [];
+  let currentRole: "user" | "assistant" | null = null;
+  let currentContent: ContentBlock[] = [];
+
+  function flush() {
+    if (currentRole && currentContent.length > 0) {
+      claude.push({ role: currentRole, content: currentContent });
+      currentContent = [];
+    }
+  }
+
+  for (const msg of dbMsgs) {
+    if (msg.role === "user") {
+      flush();
+      currentRole = "user";
+      currentContent = [{ type: "text", text: msg.content }];
+    } else if (msg.role === "assistant") {
+      flush();
+      currentRole = "assistant";
+      currentContent = [{ type: "text", text: msg.content }];
+    } else if (msg.role === "tool_use") {
+      // tool_use blocks belong to assistant turns
+      if (currentRole !== "assistant") {
+        flush();
+        currentRole = "assistant";
+        currentContent = [];
+      }
+      currentContent.push({
+        type: "tool_use",
+        id: msg.toolUseId!,
+        name: msg.toolName!,
+        input: msg.toolInput ?? {},
+      });
+    } else if (msg.role === "tool_result") {
+      // tool_result blocks belong to user turns
+      if (currentRole !== "user") {
+        flush();
+        currentRole = "user";
+        currentContent = [];
+      }
+      currentContent.push({
+        type: "tool_result",
+        tool_use_id: msg.toolUseId!,
+        content: msg.content,
+      });
+    }
+  }
+  flush();
+
+  return claude;
+}
+
+// ── Main chat function ─────────────────────────────────────────────────────
+
+export interface ChatResult {
+  assistantText: string;
+  toolCalls: { name: string; input: Record<string, unknown>; result: string }[];
+}
+
+export async function chat(
+  sessionId: string,
+  userMessage: string
+): Promise<ChatResult> {
+  const client = getClient();
+  const tools = getToolsForClaude();
+
+  // 1. Persist user message
+  await appendMessage(sessionId, { role: "user", content: userMessage });
+
+  // 2. Load full history from DB
+  const dbMsgs = await getMessages(sessionId);
+  let claudeMessages = dbMessagesToClaudeMessages(dbMsgs);
+
+  const toolCalls: ChatResult["toolCalls"] = [];
+  let finalText = "";
+
+  // 3. Agentic loop
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const response = await withClaudeSpan(
+      {
+        model: getModel(),
+        sessionId,
+        round,
+        toolCount: tools.length,
+      },
+      async (span) => {
+        const resp = await client.messages.create({
+          model: getModel(),
+          max_tokens: 8192,
+          system: SYSTEM_PROMPT,
+          tools,
+          messages: claudeMessages,
+        });
+        span.setAttribute("llm.stop_reason", resp.stop_reason || "unknown");
+        span.setAttribute("llm.usage.input_tokens", resp.usage?.input_tokens || 0);
+        span.setAttribute("llm.usage.output_tokens", resp.usage?.output_tokens || 0);
+        return resp;
+      }
+    );
+
+    // Collect text + tool_use blocks from response
+    const textBlocks: string[] = [];
+    const toolUseBlocks: Anthropic.Messages.ToolUseBlock[] = [];
+
+    for (const block of response.content) {
+      if (block.type === "text") {
+        textBlocks.push(block.text);
+      } else if (block.type === "tool_use") {
+        toolUseBlocks.push(block);
+      }
+    }
+
+    // Persist assistant text (if any)
+    const assistantText = textBlocks.join("\n");
+    if (assistantText) {
+      await appendMessage(sessionId, {
+        role: "assistant",
+        content: assistantText,
+      });
+    }
+
+    // Persist tool_use blocks
+    for (const tu of toolUseBlocks) {
+      await appendMessage(sessionId, {
+        role: "tool_use",
+        content: "",
+        toolName: tu.name,
+        toolInput: tu.input as Record<string, unknown>,
+        toolUseId: tu.id,
+      });
+    }
+
+    // If stop_reason is "end_turn" (no tool calls), we're done
+    if (response.stop_reason === "end_turn" || toolUseBlocks.length === 0) {
+      finalText = assistantText;
+      break;
+    }
+
+    // 4. Execute each tool call via MCP and collect results
+    for (const tu of toolUseBlocks) {
+      let resultText: string;
+      try {
+        resultText = await callTool(
+          tu.name,
+          tu.input as Record<string, unknown>
+        );
+      } catch (err) {
+        resultText = `Error: ${err instanceof Error ? err.message : String(err)}`;
+      }
+
+      toolCalls.push({
+        name: tu.name,
+        input: tu.input as Record<string, unknown>,
+        result: resultText,
+      });
+
+      // Persist tool_result
+      await appendMessage(sessionId, {
+        role: "tool_result",
+        content: resultText,
+        toolUseId: tu.id,
+      });
+    }
+
+    // 5. Reload messages for next Claude call
+    const updatedDbMsgs = await getMessages(sessionId);
+    claudeMessages = dbMessagesToClaudeMessages(updatedDbMsgs);
+  }
+
+  // Auto-generate a title for new sessions (first user message)
+  if (dbMsgs.length <= 1) {
+    const titleSnippet =
+      userMessage.length > 60
+        ? userMessage.slice(0, 57) + "..."
+        : userMessage;
+    await updateSessionTitle(sessionId, titleSnippet);
+  }
+
+  return { assistantText: finalText, toolCalls };
+}

@@ -1,3 +1,6 @@
+// ── OTel SDK must be imported FIRST ────────────────────────────────────────
+import "./observability/tracing.js";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
@@ -8,6 +11,14 @@ import express from "express";
 import cors from "cors";
 import { toolDefinitions, handleToolCall, pool } from "./tools.js";
 import { resolveUserEmail, filterToolsByAccess, loadAclConfig } from "./acl.js";
+import {
+  requestLoggingMiddleware,
+  errorLoggingMiddleware,
+  logInfo,
+  logError,
+  withMCPServerToolSpan,
+  startSSESessionSpan,
+} from "./observability/index.js";
 
 // Load ACL config at startup
 loadAclConfig();
@@ -16,6 +27,7 @@ loadAclConfig();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(requestLoggingMiddleware());
 
 // ── Session email storage (SSE transport → user email from headers) ──
 const sessionEmails = new Map<SSEServerTransport, string>();
@@ -56,14 +68,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     break;
   }
   const userEmail = resolveUserEmail(meta, sessionEmail);
-  return handleToolCall(name, args, userEmail);
+
+  // Wrap tool execution in a custom span
+  return withMCPServerToolSpan(
+    { toolName: name, toolArgs: (args || {}) as Record<string, unknown>, userEmail },
+    async () => handleToolCall(name, args, userEmail)
+  );
 });
 
 // SSE endpoint
 app.get("/sse", async (req, res) => {
   const headerEmail = req.headers["x-user-email"] as string | undefined;
-  console.log(`New SSE connection established${headerEmail ? ` (user: ${headerEmail})` : ""}`);
+  logInfo(`New SSE connection established`, { user_email: headerEmail });
 
+  const sseSpan = startSSESessionSpan(headerEmail);
   const transport = new SSEServerTransport("/messages", res);
 
   // Store header email for this session
@@ -74,14 +92,15 @@ app.get("/sse", async (req, res) => {
   await server.connect(transport);
 
   req.on("close", () => {
-    console.log("SSE connection closed");
+    logInfo("SSE connection closed", { user_email: headerEmail });
+    sseSpan.end();
     sessionEmails.delete(transport);
   });
 });
 
 // POST endpoint for client messages
 app.post("/messages", async (req, res) => {
-  console.log("Received message:", req.body);
+  logInfo("Received SSE message", { message_type: typeof req.body });
   res.status(200).end();
 });
 
@@ -95,6 +114,9 @@ app.get("/health", async (_req, res) => {
   }
 });
 
+// Error logging middleware (must be last)
+app.use(errorLoggingMiddleware());
+
 // Graceful shutdown
 process.on("SIGINT", async () => {
   await pool.end();
@@ -105,8 +127,9 @@ process.on("SIGINT", async () => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`MCP SSE server running on http://localhost:${PORT}`);
-  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`DB: localhost:5433/lohono_api_production`);
+  logInfo(`MCP SSE server running`, {
+    port: PORT as unknown as string,
+    sse_endpoint: `http://localhost:${PORT}/sse`,
+    health_endpoint: `http://localhost:${PORT}/health`,
+  });
 });

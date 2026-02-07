@@ -1,0 +1,60 @@
+# SigNoz internal OTel Collector — receives from the app-level collector
+# and writes to ClickHouse.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    send_batch_size: 10000
+    send_batch_max_size: 11000
+    timeout: 10s
+  signozspanmetrics/prometheus:
+    metrics_exporter: prometheus
+    latency_histogram_buckets: [100us, 1ms, 2ms, 6ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 1400ms, 2000ms, 5s, 10s, 20s, 40s, 60s]
+    dimensions_cache_size: 100000
+    dimensions:
+      - name: service.namespace
+        default: lohono-ai
+      - name: deployment.environment
+        default: production
+
+exporters:
+  clickhousetraces:
+    datasource: tcp://clickhouse:9000/?database=signoz_traces
+    migrations_folder: /signoz-collector/migrations/traces
+    docker_multi_node_cluster: false
+  clickhouselogsexporter:
+    dsn: tcp://clickhouse:9000/
+    docker_multi_node_cluster: false
+    timeout: 10s
+  clickhousemetricswrite:
+    endpoint: tcp://clickhouse:9000/?database=signoz_metrics
+    resource_to_telemetry_conversion:
+      enabled: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [signozspanmetrics/prometheus, batch]
+      exporters: [clickhousetraces]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhouselogsexporter]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhousemetricswrite]
+    metrics/spanmetrics:
+      receivers: [otlp]
+      processors: []
+      exporters: [prometheus]

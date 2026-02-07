@@ -1,5 +1,7 @@
 node_modules/
 dist/
+web/node_modules/
+web/dist/
 .git/
 .gitignore
 .env
@@ -9,3 +11,5 @@ dist/
 *.tsbuildinfo
 test-client.ts
 test-sse-client.ts
+db/
+Makefile

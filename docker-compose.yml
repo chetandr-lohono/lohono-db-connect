@@ -12,8 +12,26 @@ services:
       - "${DB_EXTERNAL_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Mount db/ for backup/restore (SQL dumps live here)
+      - ./db:/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-lohono_api} -d ${DB_NAME:-lohono_api_production}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── MongoDB (conversation state) ───────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: lohono-mongo
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -35,14 +53,78 @@ services:
       DB_USER: ${DB_USER:-lohono_api}
       DB_PASSWORD: ${DB_PASSWORD:-lohono_api_password}
       DB_NAME: ${DB_NAME:-lohono_api_production}
+      REDASH_URL: ${REDASH_URL:-}
+      REDASH_API_KEY: ${REDASH_API_KEY:-}
+      ACL_CONFIG_PATH: /app/config/acl.yml
+      MCP_USER_EMAIL: ${MCP_USER_EMAIL:-}
       SALES_FUNNEL_RULES_PATH: /app/config/sales_funnel_rules_v2.yml
       PORT: "3000"
+      # ── Observability ──
+      OTEL_SERVICE_NAME: lohono-mcp-server
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: Asia/Kolkata
     ports:
       - "${MCP_PORT:-3000}:3000"
     volumes:
-      # Mount config dir so rules can be updated without rebuilding
       - ./config:/app/config:ro
+
+  # ── MCP Client (Claude-powered backend API) ────────────────────────────
+  mcp-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: lohono-mcp-client
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4-5-20250929}
+      MCP_SSE_URL: http://mcp-server:3000
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DB_NAME: ${MONGODB_DB_NAME:-mcp_client}
+      CLIENT_PORT: "3001"
+      # PG access for staff email verification during auth
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-lohono_api}
+      DB_PASSWORD: ${DB_PASSWORD:-lohono_api_password}
+      DB_NAME: ${DB_NAME:-lohono_api_production}
+      # ── Observability ──
+      OTEL_SERVICE_NAME: lohono-mcp-client
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: Asia/Kolkata
+    ports:
+      - "${CLIENT_PORT:-3001}:3001"
+
+  # ── Web Frontend (React SPA via nginx) ──────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: lohono-web
+    restart: unless-stopped
+    depends_on:
+      mcp-client:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:8080"
 
 volumes:
   pgdata:
     driver: local
+  mongodata:
+    driver: local
+
+networks:
+  default:
+    name: lohono-network

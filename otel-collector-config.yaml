@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# OpenTelemetry Collector Configuration
+# Receives traces + logs from application services via OTLP/gRPC,
+# processes and exports to SigNoz (ClickHouse-backed).
+# ═══════════════════════════════════════════════════════════════════════════
+
+receivers:
+  # OTLP receiver — applications send traces/logs here
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch processor — reduces export overhead
+  batch:
+    send_batch_size: 1000
+    send_batch_max_size: 1100
+    timeout: 10s
+
+  # Memory limiter — prevents OOM under high load
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Resource detection — enriches spans with host info
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    override: false
+
+  # Attributes processor — add common attributes
+  attributes:
+    actions:
+      - key: deployment.environment
+        value: production
+        action: upsert
+      - key: host.timezone
+        value: Asia/Kolkata
+        action: upsert
+
+exporters:
+  # SigNoz backend (ClickHouse via OTel Collector's OTLP exporter)
+  otlp/signoz:
+    endpoint: signoz-otel-collector:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # Debug exporter for troubleshooting (logs to collector stdout)
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, zpages]
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, attributes, batch]
+      exporters: [otlp/signoz]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, attributes, batch]
+      exporters: [otlp/signoz]
